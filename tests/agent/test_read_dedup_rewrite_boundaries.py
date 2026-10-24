@@ -142,3 +142,200 @@ def test_native_checkpoint_rearms_read_dedup(served, monkeypatch):
     re_view = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") == "call_view"]
     assert re_view and "Do the demo steps." in re_view[-1]["content"]
     assert _dedup_state()[1] is False  # the file read served before the checkpoint is off the wire too
+
+
+def _warm_guardrail(hard_stop: bool = True):
+    from agent.tool_guardrails import (
+        LoopCapConfig,
+        ToolCallGuardrailConfig,
+        ToolCallGuardrailController,
+    )
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=hard_stop,
+            loop_caps=LoopCapConfig(max_web_searches=2, max_subagents=2),
+        )
+    )
+    skill_args = {"name": "demo-skill"}
+    file_args = {"path": "/x/big.txt"}
+    fail_args = {"command": "failing-cmd"}
+    for _ in range(5):
+        controller.after_call("skill_view", skill_args, "unchanged", failed=False)
+        controller.after_call("read_file", file_args, "unchanged", failed=False)
+        controller.after_call("terminal", fail_args, '{"error":"fail"}', failed=True)
+    return controller, skill_args, file_args, fail_args
+
+
+@pytest.mark.parametrize("outcome", ["spliced", "no_op", "failed"])
+def test_micro_compaction_guardrail_read_tracking(served, outcome):
+    """A micro-compaction splice resets read tracking while preserving failure counters and halt;
+    no-op and failed passes do not renew read allowances."""
+    import logging
+    from agent.turn_finalizer import _micro_compact_after_turn
+
+    controller, skill_args, file_args, fail_args = _warm_guardrail()
+    for i in range(2):
+        controller.before_call("web_search", {"query": str(i)})
+    halt = controller.before_call("web_search", {"query": "over-cap"})
+
+    compressor = MagicMock()
+    compressor._micro_compact_enabled = True
+    compressor._flush_scan_cursor_invalidated = False
+    messages = list(served)
+    if outcome == "spliced":
+        compressor._micro_compact = lambda msgs, **_kw: [{"role": "user", "content": "[MICRO] loaded demo-skill"}, *msgs[4:]]
+    elif outcome == "no_op":
+        compressor._micro_compact = lambda msgs, **_kw: msgs
+    else:
+        def _fail(msgs, **_kw):
+            raise RuntimeError("micro-compact failed")
+        compressor._micro_compact = _fail
+
+    agent = SimpleNamespace(
+        context_compressor=compressor,
+        compression_checkpoint_required=False,
+        _persist_disabled=False,
+        session_id="micro-session",
+        _tool_guardrails=controller,
+    )
+
+    _micro_compact_after_turn(agent, messages, "done", logging.getLogger("test"), TASK)
+
+    if outcome == "spliced":
+        assert controller.before_call("skill_view", skill_args).allows_execution
+        assert controller.before_call("read_file", file_args).allows_execution
+        assert controller.halt_decision is halt
+        for _ in range(5):
+            controller.after_call("skill_view", skill_args, "unchanged", failed=False)
+        assert controller.before_call("skill_view", skill_args).code == "idempotent_no_progress_block"
+    else:
+        assert controller.halt_decision is halt
+        assert controller.before_call("skill_view", skill_args).code == "idempotent_no_progress_block"
+        assert controller.before_call("read_file", file_args).code == "idempotent_no_progress_block"
+
+    assert controller.before_call("terminal", fail_args).code == "repeated_exact_failure_block"
+
+
+@pytest.mark.parametrize("scenario", ["with_task", "missing_task", "no_checkpoint", "non_replayable"])
+def test_native_checkpoint_guardrail_read_tracking(served, monkeypatch, scenario):
+    """Native Responses compaction checkpoint resets guardrail read tracking while preserving
+    failures and halts. Missing task id resets controller without clearing other tasks' caches;
+    absent or non-replayable checkpoints do not renew allowances."""
+    from agent.chat_completion_helpers import build_assistant_message
+    from run_agent import AIAgent
+
+    monkeypatch.setattr(
+        "agent.model_metadata._fetch_codex_oauth_context_lengths_with_source",
+        lambda _t, **_kw: ({}, False),
+    )
+    controller, skill_args, file_args, fail_args = _warm_guardrail()
+    for i in range(2):
+        controller.before_call("web_search", {"query": str(i)})
+    halt = controller.before_call("web_search", {"query": "over-cap"})
+
+    agent = AIAgent(
+        model="gpt-5.6",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="codex-token",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        max_iterations=4,
+    )
+    agent.codex_responses_native_compaction = True
+    agent.runtime_capabilities = {"native_compaction": True} if scenario != "non_replayable" else {}
+    agent._current_task_id = TASK if scenario != "missing_task" else None
+    agent.session_id = "native-session"
+    agent._tool_guardrails = controller
+
+    items = (
+        [{"type": "compaction", "encrypted_content": "opaque-checkpoint"}]
+        if scenario != "no_checkpoint"
+        else [{"type": "reasoning", "content": "thinking"}]
+    )
+    assistant_message = SimpleNamespace(
+        content="", tool_calls=None, reasoning_content=None, reasoning=None,
+        reasoning_details=None, codex_reasoning_items=items,
+    )
+
+    build_assistant_message(agent, assistant_message, "stop")
+
+    if scenario in ("with_task", "missing_task"):
+        assert controller.before_call("skill_view", skill_args).allows_execution
+        assert controller.before_call("read_file", file_args).allows_execution
+        assert controller.halt_decision is halt
+        if scenario == "missing_task":
+            # Other tasks' read dedup caches remain untouched
+            assert _dedup_state() == (True, True)
+        else:
+            # Task-specific file dedup cache was cleared
+            assert _dedup_state()[1] is False
+    else:
+        assert controller.halt_decision is halt
+        assert controller.before_call("skill_view", skill_args).code == "idempotent_no_progress_block"
+        assert controller.before_call("read_file", file_args).code == "idempotent_no_progress_block"
+        assert _dedup_state() == (True, True)
+
+    assert controller.before_call("terminal", fail_args).code == "repeated_exact_failure_block"
+
+
+def test_native_checkpoint_allows_mid_turn_reload_when_guardrail_at_threshold(served, monkeypatch):
+    """End-to-end turn execution: when a native compaction checkpoint arrives in the same round
+    where repeat reads reached the threshold, the subsequent reload executes rather than being blocked."""
+    from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+    from run_agent import AIAgent
+
+    monkeypatch.setattr(
+        "agent.model_metadata._fetch_codex_oauth_context_lengths_with_source",
+        lambda _t, **_kw: ({}, False),
+    )
+    agent = AIAgent(
+        model="gpt-5.6",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="codex-token",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        max_iterations=4,
+    )
+    agent.codex_responses_native_compaction = True
+    agent.runtime_capabilities = {"native_compaction": True}
+    agent._tool_guardrails = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+
+    usage = SimpleNamespace(input_tokens=9, output_tokens=1, total_tokens=10)
+    skill_args = {"name": "demo-skill"}
+
+    def _mock_call(api_kwargs):
+        # Warm via after_call only; no artificial pre-halt before_call
+        for _ in range(5):
+            agent._tool_guardrails.after_call("skill_view", skill_args, "unchanged", failed=False)
+
+        return SimpleNamespace(
+            output=[
+                SimpleNamespace(type="compaction", encrypted_content="opaque-checkpoint"),
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_view_mid",
+                    call_id="call_view_mid",
+                    name="skill_view",
+                    arguments=json.dumps(skill_args),
+                ),
+            ],
+            usage=usage,
+            status="completed",
+            model="gpt-5.6",
+        )
+
+    responses = [_mock_call, lambda _kw: SimpleNamespace(
+        output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="done")])],
+        usage=usage,
+        status="completed",
+        model="gpt-5.6",
+    )]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0)(api_kwargs))
+
+    result = _run(agent, served, monkeypatch)
+
+    re_view = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") == "call_view_mid"]
+    assert re_view and "Do the demo steps." in re_view[-1]["content"]
+    assert agent._tool_guardrails.before_call("skill_view", skill_args).allows_execution

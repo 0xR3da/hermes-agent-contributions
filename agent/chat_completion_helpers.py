@@ -1751,10 +1751,17 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                     # The next request drops every item before this checkpoint, so a repeat
                     # read must serve content again, not an "unchanged" stub (#32106).
                     # Without a task id the reset would clear every task's caches.
+                    guardrails = getattr(agent, "_tool_guardrails", None)
                     if task_id := getattr(agent, "_current_task_id", None):
                         from agent.conversation_compression import _reset_read_dedup_caches
 
-                        _reset_read_dedup_caches(task_id, session_id=getattr(agent, "session_id", None) or "")
+                        _reset_read_dedup_caches(
+                            task_id,
+                            session_id=getattr(agent, "session_id", None) or "",
+                            guardrails=guardrails,
+                        )
+                    elif guardrails is not None:
+                        guardrails.reset_read_tracking()
 
     if assistant_tool_calls:
         msg["tool_calls"] = [_assistant_tool_call_dict(agent, tc, i) for i, tc in enumerate(assistant_tool_calls)]
